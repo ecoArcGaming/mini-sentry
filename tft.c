@@ -19,7 +19,8 @@
 //      data - 8-bit value
 //==============================================================
 void write8_a0(uint8 data)
-{
+{   while(SPIM_1_GetTxBufferSize() > 0); 
+    CyDelayUs(5);
 	DC_Write(0x00); 						        // set DC line low
     SPIM_1_WriteTxData(data);         		        // send data to transmit buffer
     while (!(SPIM_1_ReadTxStatus() & 0x01)){};	    // wait for data to be sent
@@ -33,7 +34,8 @@ void write8_a0(uint8 data)
 //      data - 8-bit value
 //==============================================================
 void write8_a1(uint8 data)
-{
+{   while(SPIM_1_GetTxBufferSize() > 0); 
+    CyDelayUs(5);
 	DC_Write(0x01); 						        // set DC line high
     SPIM_1_WriteTxData(data);                       // send data to transmit buffer
     while (!(SPIM_1_ReadTxStatus() & 0x01)){};	    // wait for data to be sent
@@ -48,7 +50,8 @@ void write8_a1(uint8 data)
 //      N - the size of the array *pData
 //==============================================================
 void writeM8_a1(uint8 *pData, int N)
-{
+{   while(SPIM_1_GetTxBufferSize() > 0); 
+    CyDelayUs(5);
 	DC_Write(0x01); 						        // set DC line high
     int i;
     for (i=0; i<N; i++)

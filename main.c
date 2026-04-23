@@ -3,7 +3,10 @@
 #include "MLX90640_I2C_Driver.h"
 #include <stdio.h>
 #include "GUI.h"
-#include <math.h> // Add this to the top of your file with the other includes
+#include "BUTTON.h"
+#include "WM.h"
+#include "TEXT.h" // Required for the TEXT widget
+#include <math.h>
 
 // DELTA DRAWING STATE
 static float prevTemps[768] = {-100.0f}; 
@@ -12,8 +15,8 @@ static float prevTemps[768] = {-100.0f};
 #define SCALE 8
 #define OFFSET_X 0 
 #define OFFSET_Y 40 
-/* * standard 16-bit RGB565 color definitions
- */
+
+/* * standard 16-bit RGB565 color definitions */
 #define RED   0xF800
 #define BLUE  0x001F
 #define MLX_I2C_ADDR 0x33
@@ -27,21 +30,46 @@ static float prevTemps[768] = {-100.0f};
 #define MIN_PWM_PAN 1000
 #define MIN_PWM_TILT 1084
 
+#define TOUCH_X_MIN 300
+#define TOUCH_X_MAX 3800
+#define TOUCH_Y_MIN 300
+#define TOUCH_Y_MAX 3800
+
+#define LCD_WIDTH  240
+#define LCD_HEIGHT 320
+
+// XPT2046 Command Bytes (12-bit mode, differential)
+#define CMD_READ_X 0xD0
+#define CMD_READ_Y 0x90
 // Allocate memory for the sensor data, ~20kb RAM
 static uint16_t eeMLX90640[832];    
 static uint16_t mlx90640Frame[834]; 
 static float mlx90640Image[768];    
 paramsMLX90640 mlx90640;
 
-
 // state tracking, neutral defaults for locations, all white for frame data
 static uint16 current_pan_pwm = 1500;  
 static uint16 current_tilt_pwm = 1500;
-//static uint16_t prevColors[768] = {0xFFFF}; 
 
+// Global Handle for the Text Widget ---
+TEXT_Handle hTxtMode;
 
+// 1. Create a volatile flag for the ISR to talk to the main loop
+volatile uint8_t touch_flag = 0;
+
+CY_ISR(Touch_ISR_Handler)
+{
+    T_INT_ClearInterrupt();
+    touch_flag = 1; 
+}
+void TFT_Wait(void)
+{
+    while(SPIM_1_GetTxBufferSize() > 0); 
+    CyDelayUs(5); 
+}
 void TFT_SendCommand(uint8_t cmd)
 {
+    TFT_Wait();
     DC_Write(0); 
     SPIM_1_ClearTxBuffer(); 
     SPIM_1_ReadTxStatus();  
@@ -51,7 +79,8 @@ void TFT_SendCommand(uint8_t cmd)
 }
 
 void TFT_SendData(uint8_t data)
-{
+{   
+    TFT_Wait();
     DC_Write(1); 
     SPIM_1_ClearTxBuffer(); 
     SPIM_1_ReadTxStatus();  
@@ -60,7 +89,6 @@ void TFT_SendData(uint8_t data)
     while(!(SPIM_1_ReadTxStatus() & SPIM_1_STS_SPI_DONE));
 }
 
-// Helper function to set a specific drawing window
 void TFT_SetWindow(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 {
     TFT_SendCommand(0x2A); // CASET
@@ -141,6 +169,8 @@ uint16_t GetThermalColor(float value, float min, float max)
     }
     return ((b & 0xF8) << 8) | ((g & 0xFC) << 3) | (r >> 3);
 }
+
+
 void Update_TFT_Image(float* thermalImage, float minTemp, float maxTemp)
 {
     uint16_t x, y;
@@ -156,22 +186,18 @@ void Update_TFT_Image(float* thermalImage, float minTemp, float maxTemp)
             // Only redraw if the temperature changed by more than 1 degree
             if (fabsf(tempValue - prevTemps[index]) > 1.0f) 
             {
-                // Update the memory map
                 prevTemps[index] = tempValue; 
                 color = GetThermalColor(tempValue, minTemp, maxTemp);
                 
-                // Calculate actual screen coordinates with the UI offset
                 uint16_t screen_X = (x * SCALE) + OFFSET_X;
                 uint16_t screen_Y = (y * SCALE) + OFFSET_Y;
                 
-                // Open a window exactly the size of our new block (8x8)
                 TFT_SetWindow(screen_X, screen_Y, screen_X + (SCALE - 1), screen_Y + (SCALE - 1));
                 
                 DC_Write(1); 
                 uint8_t hi = color >> 8;
                 uint8_t low = color & 0xFF;
                 
-                // Stream 64 pixels (8x8) to fill the block
                 for(int p = 0; p < (SCALE * SCALE); p++) 
                 {
                     while(SPIM_1_GetTxBufferSize() >= 4); 
@@ -181,7 +207,6 @@ void Update_TFT_Image(float* thermalImage, float minTemp, float maxTemp)
                     SPIM_1_WriteTxData(low);
                 }
                 
-               
                 while(SPIM_1_GetTxBufferSize() > 0);
                 CyDelayUs(2); 
             }
@@ -263,6 +288,119 @@ void Track_Target(float minTemp, float maxTemp, uint16_t target_x, uint16_t targ
     PWM_Tilt_WriteCompare(current_tilt_pwm);
 }
 
+//  events on the background window 
+static void _cbBackground(WM_MESSAGE * pMsg) 
+{
+    int NCode, Id;
+
+    switch (pMsg->MsgId) 
+    {  
+        case WM_NOTIFY_PARENT:
+            Id    = WM_GetId(pMsg->hWinSrc);
+            NCode = pMsg->Data.v;
+
+            if (NCode == WM_NOTIFICATION_RELEASED) 
+            {
+                // Change the text 
+                switch (Id) 
+                {
+                    case GUI_ID_BUTTON0:
+                        TEXT_SetText(hTxtMode, "Mode: Auto");
+                        break;
+                    case GUI_ID_BUTTON1:
+                        TEXT_SetText(hTxtMode, "Mode: Zone");
+                        break;
+                    case GUI_ID_BUTTON2:
+                        TEXT_SetText(hTxtMode, "Mode: Audio");
+                        break;
+                }
+            }
+            break;
+            
+        default:
+            WM_DefaultProc(pMsg);
+            break;
+    }
+}
+static uint16_t Touch_Read_Axis(uint8_t command)
+{
+    uint16_t data = 0;
+    uint8_t msb, lsb;
+    CS_1_Write(0); 
+    // 2. Send the Command Byte
+    SPIM_2_ClearRxBuffer();
+    SPIM_2_WriteTxData(command);
+    while(!(SPIM_2_ReadTxStatus() & SPIM_2_STS_SPI_DONE));
+    SPIM_2_ReadRxData(); // Clear the dummy read from the buffer
+
+    // 3. Send 0x00 to clock in the Most Significant Byte (MSB)
+    SPIM_2_WriteTxData(0x00);
+    while(!(SPIM_2_ReadTxStatus() & SPIM_2_STS_SPI_DONE));
+    msb = SPIM_2_ReadRxData();
+
+    // 4. Send 0x00 to clock in the Least Significant Byte (LSB)
+    SPIM_2_WriteTxData(0x00);
+    while(!(SPIM_2_ReadTxStatus() & SPIM_2_STS_SPI_DONE));
+    lsb = SPIM_2_ReadRxData();
+     CS_1_Write(1); 
+    // 6. Combine the bytes. 
+    // The XPT2046 sends a 12-bit value left-aligned across the 16 bits.
+    data = ((msb << 8) | lsb) >> 3;
+    
+    return (data & 0x0FFF); // Mask to ensure it's strictly 12 bits
+}
+
+// The main function called by your loop when the interrupt flag fires
+void Update_Touch_State(void)
+{
+    GUI_PID_STATE touchState;
+    uint16_t raw_x, raw_y;
+    int32_t mapped_x, mapped_y;
+
+    // Read the physical pin state to ensure we are still touching (Debounce check)
+    if (T_INT_Read() == 0) 
+    {
+        // Read raw 12-bit ADC values from the touch controller
+        raw_x = Touch_Read_Axis(CMD_READ_X);
+        raw_y = Touch_Read_Axis(CMD_READ_Y);
+
+        // Map the raw ADC values (0-4095) to screen coordinates (320x240)
+        mapped_x = ((int32_t)(raw_x - TOUCH_X_MIN) * LCD_WIDTH) / (TOUCH_X_MAX - TOUCH_X_MIN);
+        mapped_y = ((int32_t)(raw_y - TOUCH_Y_MIN) * LCD_HEIGHT) / (TOUCH_Y_MAX - TOUCH_Y_MIN);
+
+        // Clamp the mapped values so they don't draw outside the screen bounds
+        if (mapped_x < 0) mapped_x = 0;
+        if (mapped_x >= LCD_WIDTH) mapped_x = LCD_WIDTH - 1;
+        
+        if (mapped_y < 0) mapped_y = 0;
+        if (mapped_y >= LCD_HEIGHT) mapped_y = LCD_HEIGHT - 1;
+
+        // Invert axes if necessary 
+        // (Uncomment these if your touch moves left when you drag right, or up when dragging down)
+        // mapped_x = (LCD_WIDTH - 1) - mapped_x;
+        mapped_y = (LCD_HEIGHT - 1) - mapped_y;
+
+        // Swap axes if necessary 
+        // (If your touch X is moving the Y axis, you need to swap them depending on screen rotation)
+        // int32_t temp = mapped_x;
+        // mapped_x = mapped_y;
+        //mapped_y = temp;
+
+        // Feed the pressed state and coordinates to emWin
+        touchState.x = mapped_x;
+        touchState.y = mapped_y;
+        touchState.Pressed = 1;
+    } 
+    else 
+    {
+        // Screen is not currently being touched
+        touchState.x = -1;
+        touchState.y = -1;
+        touchState.Pressed = 0;
+    }
+
+    GUI_TOUCH_StoreStateEx(&touchState);
+}
 int main(void)
 {
     CyGlobalIntEnable; 
@@ -271,7 +409,12 @@ int main(void)
     PWM_Pan_Start();
     PWM_Tilt_Start();
     SPIM_1_Start();
+    SPIM_2_Start();
     LED_Write(1); 
+    
+    CS_1_Write(0);
+    Touch_Read_Axis(CMD_READ_X); // 0xD0 has PD0=0, enabling PENIRQ
+    CS_1_Write(1);
     
     // Initialize Display
     TFT_Init(); 
@@ -279,11 +422,30 @@ int main(void)
     // Initialize emWin GUI 
     GUI_Init(); 
     
-   
+    // Attach the callback to the background window, attach ISR to vector
+    T_ISR_StartEx(Touch_ISR_Handler); 
+    WM_SetCallback(WM_HBKWIN, _cbBackground);
+    
     GUI_SetFont(&GUI_Font16_ASCII);
     GUI_SetColor(GUI_WHITE);
-    GUI_SetTextMode(GUI_TM_TRANS); // Transparent background so it doesn't overwrite thermal data
-    GUI_DispStringAt("TRACKING ACTIVE", 10, 10); 
+    
+    // x0, y0, xSize, ySize, hParent, Flags, ExFlags, Id, pText
+    hTxtMode = TEXT_CreateEx(10, 10, 150, 20, WM_HBKWIN, WM_CF_SHOW, 0, GUI_ID_TEXT0, "Mode: Auto");
+    TEXT_SetTextColor(hTxtMode, GUI_WHITE);
+    TEXT_SetFont(hTxtMode, &GUI_Font16_ASCII);
+    TEXT_SetBkColor(hTxtMode, GUI_BLACK);
+    
+    // Create Buttons
+    BUTTON_Handle hBtnAuto, hBtnZone, hBtnAudio;
+    
+    hBtnAuto = BUTTON_Create(0,   270, 80, 40, GUI_ID_BUTTON0, WM_CF_SHOW);
+    BUTTON_SetText(hBtnAuto, "Auto");
+
+    hBtnZone = BUTTON_Create(80,  270, 80, 40, GUI_ID_BUTTON1, WM_CF_SHOW);
+    BUTTON_SetText(hBtnZone, "Zone");
+
+    hBtnAudio = BUTTON_Create(160, 270, 80, 40, GUI_ID_BUTTON2, WM_CF_SHOW);
+    BUTTON_SetText(hBtnAudio, "Audio");
     
     // Init Camera
     MLX90640_I2CInit();
@@ -293,8 +455,21 @@ int main(void)
     MLX90640_ExtractParameters(eeMLX90640, &mlx90640);
     
     for(;;)
-    {
+    {       
+      
         int status = MLX90640_GetFrameData(MLX_I2C_ADDR, mlx90640Frame);
+        if (T_INT_Read() == 0 || touch_flag == 1) 
+        {
+            // Mask the interrupt so SPI traffic doesn't trigger the ISR 
+            T_ISR_Disable();
+            Update_Touch_State();   // SPI touch read here
+            T_ISR_ClearPending();
+            T_ISR_Enable();
+        }
+       
+        
+      
+        GUI_Exec(); // EmWin processes the touch states here
         
         if (status >= 0) 
         {
