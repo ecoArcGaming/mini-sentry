@@ -22,13 +22,13 @@ static float prevTemps[768] = {-100.0f};
 #define MLX_I2C_ADDR 0x33
 #define CENTER_X 15.5
 #define CENTER_Y 11.5
-#define TARGET_CUTOFF 10.0
+#define TARGET_CUTOFF 15.0
 #define K_PAN 6.0
 #define K_TILT 6.0
 #define MAX_PWM_PAN 2000 // us 
-#define MAX_PWM_TILT 1916
+#define MAX_PWM_TILT 2500
 #define MIN_PWM_PAN 1000
-#define MIN_PWM_TILT 1084
+#define MIN_PWM_TILT 1200
 
 #define TOUCH_X_MIN 300
 #define TOUCH_X_MAX 3800
@@ -56,6 +56,39 @@ TEXT_Handle hTxtMode;
 
 // 1. Create a volatile flag for the ISR to talk to the main loop
 volatile uint8_t touch_flag = 0;
+volatile enum Mode{
+    AUTO, 
+    STATION,
+    AUDIO
+};
+enum Mode curMode = AUTO;
+
+#define ALERT_TEMP_CUTOFF 30.0f // Define what counts as "heating object"
+#define BOX_SIZE 10             // 10x10 bounding box
+#define MAX_BOX_X (32 - BOX_SIZE) // Maximum X index (32 - 10 = 22)
+#define MAX_BOX_Y (24 - BOX_SIZE) // Maximum Y index (24 - 10 = 14)
+
+// Box tracking variables
+static uint8_t box_x = 11; // Start centered
+static uint8_t box_y = 7;
+
+// MUST BE VOLATILE: Modified inside the new Button ISR
+volatile uint8_t control_axis = 0; // 0 = X-axis, 1 = Y-axis
+
+// Helper to force the display to redraw if the box moves
+void Force_TFT_Redraw(void)
+{
+    for(int i = 0; i < 768; i++) 
+    {
+        prevTemps[i] = -100.0f;
+    }
+}
+
+CY_ISR(Button_ISR_Handler)
+{
+    Pin_Button_ClearInterrupt(); // Clear the interrupt at the pin level
+    control_axis = !control_axis; // Toggle 0 and 1
+}
 
 CY_ISR(Touch_ISR_Handler)
 {
@@ -213,7 +246,67 @@ void Update_TFT_Image(float* thermalImage, float minTemp, float maxTemp)
         }
     }
 }
+void Update_TFT_Image_Box(float* thermalImage, float minTemp, float maxTemp)
+{
+    uint16_t x, y;
+    uint16_t color;
 
+    for(y = 0; y < 24; y++)
+    {
+        for(x = 0; x < 32; x++)
+        {
+            int index = y * 32 + x;
+            float tempValue = thermalImage[index];
+            
+            // Check if this pixel is on the 10x10 box border
+            uint8_t is_border = 0;
+            if (curMode == STATION) 
+            {
+                if (x >= box_x && x < box_x + BOX_SIZE && y >= box_y && y < box_y + BOX_SIZE) 
+                {
+                    // If it's on the edge of our 10x10 square, flag it
+                    if (x == box_x || x == box_x + (BOX_SIZE - 1) || y == box_y || y == box_y + (BOX_SIZE - 1)) {
+                        is_border = 1;
+                    }
+                }
+            }
+            
+            // Redraw if temp changed OR if Force_TFT_Redraw wiped prevTemps
+            if (fabsf(tempValue - prevTemps[index]) > 1.0f) 
+            {
+                prevTemps[index] = tempValue; 
+                
+                // Override color for the bounding box
+                if (is_border) {
+                    color = RED;
+                } else {
+                    color = GetThermalColor(tempValue, minTemp, maxTemp);
+                }
+                
+                uint16_t screen_X = (x * SCALE) + OFFSET_X;
+                uint16_t screen_Y = (y * SCALE) + OFFSET_Y;
+                
+                TFT_SetWindow(screen_X, screen_Y, screen_X + (SCALE - 1), screen_Y + (SCALE - 1));
+                
+                DC_Write(1); 
+                uint8_t hi = color >> 8;
+                uint8_t low = color & 0xFF;
+                
+                for(int p = 0; p < (SCALE * SCALE); p++) 
+                {
+                    while(SPIM_1_GetTxBufferSize() >= 4); 
+                    SPIM_1_WriteTxData(hi);
+                    
+                    while(SPIM_1_GetTxBufferSize() >= 4); 
+                    SPIM_1_WriteTxData(low);
+                }
+                
+                while(SPIM_1_GetTxBufferSize() > 0);
+                CyDelayUs(2); 
+            }
+        }
+    }
+}
 // MLX90640 I2C API Functions
 void MLX90640_I2CInit(void) { I2C_MASTER_1_Start(); }
 void MLX90640_I2CFreqSet(int freq) { (void)freq; }
@@ -301,17 +394,23 @@ static void _cbBackground(WM_MESSAGE * pMsg)
 
             if (NCode == WM_NOTIFICATION_RELEASED) 
             {
-                // Change the text 
+                // Change the text and state
                 switch (Id) 
                 {
                     case GUI_ID_BUTTON0:
                         TEXT_SetText(hTxtMode, "Mode: Auto");
+                        curMode = AUTO;
+                        Force_TFT_Redraw();
                         break;
                     case GUI_ID_BUTTON1:
                         TEXT_SetText(hTxtMode, "Mode: Zone");
+                        curMode = STATION;
+                        Force_TFT_Redraw();
                         break;
                     case GUI_ID_BUTTON2:
                         TEXT_SetText(hTxtMode, "Mode: Audio");
+                        curMode = AUDIO;
+                        Force_TFT_Redraw();
                         break;
                 }
             }
@@ -327,24 +426,24 @@ static uint16_t Touch_Read_Axis(uint8_t command)
     uint16_t data = 0;
     uint8_t msb, lsb;
     CS_1_Write(0); 
-    // 2. Send the Command Byte
+    // Command Byte
     SPIM_2_ClearRxBuffer();
     SPIM_2_WriteTxData(command);
     while(!(SPIM_2_ReadTxStatus() & SPIM_2_STS_SPI_DONE));
     SPIM_2_ReadRxData(); // Clear the dummy read from the buffer
 
-    // 3. Send 0x00 to clock in the Most Significant Byte (MSB)
+    //MSB
     SPIM_2_WriteTxData(0x00);
     while(!(SPIM_2_ReadTxStatus() & SPIM_2_STS_SPI_DONE));
     msb = SPIM_2_ReadRxData();
 
-    // 4. Send 0x00 to clock in the Least Significant Byte (LSB)
+    // LSB
     SPIM_2_WriteTxData(0x00);
     while(!(SPIM_2_ReadTxStatus() & SPIM_2_STS_SPI_DONE));
     lsb = SPIM_2_ReadRxData();
      CS_1_Write(1); 
-    // 6. Combine the bytes. 
-    // The XPT2046 sends a 12-bit value left-aligned across the 16 bits.
+    // Combine the bytes. 
+    //  12-bit value left-aligned across the 16 bits.
     data = ((msb << 8) | lsb) >> 3;
     
     return (data & 0x0FFF); // Mask to ensure it's strictly 12 bits
@@ -375,18 +474,9 @@ void Update_Touch_State(void)
         if (mapped_y < 0) mapped_y = 0;
         if (mapped_y >= LCD_HEIGHT) mapped_y = LCD_HEIGHT - 1;
 
-        // Invert axes if necessary 
-        // (Uncomment these if your touch moves left when you drag right, or up when dragging down)
-        // mapped_x = (LCD_WIDTH - 1) - mapped_x;
+        // Invert axes 
         mapped_y = (LCD_HEIGHT - 1) - mapped_y;
 
-        // Swap axes if necessary 
-        // (If your touch X is moving the Y axis, you need to swap them depending on screen rotation)
-        // int32_t temp = mapped_x;
-        // mapped_x = mapped_y;
-        //mapped_y = temp;
-
-        // Feed the pressed state and coordinates to emWin
         touchState.x = mapped_x;
         touchState.y = mapped_y;
         touchState.Pressed = 1;
@@ -408,9 +498,18 @@ int main(void)
     // Start Hardware Blocks
     PWM_Pan_Start();
     PWM_Tilt_Start();
+    PWM_ALERT_Start();
+
     SPIM_1_Start();
     SPIM_2_Start();
+    
+    ADC_DelSig_1_Start();               // start the ADC_DelSig_1
+    ADC_DelSig_1_StartConvert();        // start the ADC_DelSig_1 conversion
     LED_Write(1); 
+    
+    // --- ATTACH ISRs ---
+    T_ISR_StartEx(Touch_ISR_Handler); 
+    Button_ISR_StartEx(Button_ISR_Handler); // <--- START THE NEW BUTTON ISR HERE
     
     CS_1_Write(0);
     Touch_Read_Axis(CMD_READ_X); // 0xD0 has PD0=0, enabling PENIRQ
@@ -422,8 +521,7 @@ int main(void)
     // Initialize emWin GUI 
     GUI_Init(); 
     
-    // Attach the callback to the background window, attach ISR to vector
-    T_ISR_StartEx(Touch_ISR_Handler); 
+    // Attach the callback to the background window
     WM_SetCallback(WM_HBKWIN, _cbBackground);
     
     GUI_SetFont(&GUI_Font16_ASCII);
@@ -456,7 +554,35 @@ int main(void)
     
     for(;;)
     {       
-      
+        if (curMode == STATION)
+        {
+            // Read Potentiometer
+            uint16_t adc_val = 0;
+            if( ADC_DelSig_1_IsEndConversion(ADC_DelSig_1_WAIT_FOR_RESULT) )
+            {
+                adc_val = ADC_DelSig_1_GetResult16();
+            }
+            if (adc_val > 4095) adc_val = 4095;
+
+            // Update box coordinates
+            uint8_t old_box_x = box_x;
+            uint8_t old_box_y = box_y;
+            
+            // control_axis is safely toggled by the Button_ISR_Handler now
+            if (control_axis == 0) {
+                // Map 0-4095 to 0-22
+                box_x = (uint8_t)(((uint32_t)adc_val * MAX_BOX_X) / 4095);
+            } else {
+                // Map 0-4095 to 0-14
+                box_y = (uint8_t)(((uint32_t)adc_val * MAX_BOX_Y) / 4095);
+            }
+
+            // If the box moved, force the screen to redraw to clear old red borders
+            if (box_x != old_box_x || box_y != old_box_y) {
+                Force_TFT_Redraw();
+            }
+        }
+        
         int status = MLX90640_GetFrameData(MLX_I2C_ADDR, mlx90640Frame);
         if (T_INT_Read() == 0 || touch_flag == 1) 
         {
@@ -466,9 +592,7 @@ int main(void)
             T_ISR_ClearPending();
             T_ISR_Enable();
         }
-       
         
-      
         GUI_Exec(); // EmWin processes the touch states here
         
         if (status >= 0) 
@@ -488,10 +612,44 @@ int main(void)
                     max_y = i / 32;
                 }
             }
+            if (curMode == AUTO){
+                Track_Target(minTemp, maxTemp, max_x, max_y);     
+                Update_TFT_Image(mlx90640Image, minTemp, maxTemp); 
+
+            }
             
-            // Track_Target(minTemp, maxTemp, max_x, max_y);            
+            if (curMode == STATION)
+            {   
+                Update_TFT_Image_Box(mlx90640Image, minTemp, maxTemp); 
+
+                uint8_t target_detected = 0;
+                
+                // Scan only the pixels inside the 10x10 box
+                for (int y = box_y; y < box_y + BOX_SIZE; y++) 
+                {
+                    for (int x = box_x; x < box_x + BOX_SIZE; x++) 
+                    {
+                        int index = y * 32 + x;
+                        if (mlx90640Image[index] > ALERT_TEMP_CUTOFF) 
+                        {
+                            target_detected = 1;
+                            break; 
+                        }
+                    }
+                    if (target_detected) break;
+                }
+
+                if (target_detected) {
+                    PWM_ALERT_WriteCompare(30); // Turn alert ON
+                } else {
+                    PWM_ALERT_WriteCompare(0);  // Turn alert OFF
+                }
+            }
+            else 
+            {
+                PWM_ALERT_WriteCompare(0); // Ensure alert is off if not in STATION mode
+            }
             
-            Update_TFT_Image(mlx90640Image, minTemp, maxTemp); 
         }
     }
 }
