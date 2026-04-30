@@ -5,21 +5,24 @@
 #include "GUI.h"
 #include "BUTTON.h"
 #include "WM.h"
-#include "TEXT.h" // Required for the TEXT widget
+#include "TEXT.h" 
 #include <math.h>
 
-// DELTA DRAWING STATE
+// buffer for previous frame
 static float prevTemps[768] = {-100.0f}; 
 
-//  scaling and UI offsets
+// offsets for the camera 
 #define SCALE 8
 #define OFFSET_X 0 
 #define OFFSET_Y 40 
 
-/* * standard 16-bit RGB565 color definitions */
+/* * 16-bit RGB color  */
 #define RED   0xF800
 #define BLUE  0x001F
+
 #define MLX_I2C_ADDR 0x33
+
+// the feedback system
 #define CENTER_X 15.5
 #define CENTER_Y 11.5
 #define TARGET_CUTOFF 15.0
@@ -30,18 +33,20 @@ static float prevTemps[768] = {-100.0f};
 #define MIN_PWM_PAN 1000
 #define MIN_PWM_TILT 1200
 
+// touch screen
 #define TOUCH_X_MIN 300
 #define TOUCH_X_MAX 3800
 #define TOUCH_Y_MIN 300
 #define TOUCH_Y_MAX 3800
-
+// TFT 
 #define LCD_WIDTH  240
 #define LCD_HEIGHT 320
 
-// XPT2046 Command Bytes (12-bit mode, differential)
+// XPT2046 cmds
 #define CMD_READ_X 0xD0
 #define CMD_READ_Y 0x90
-// Allocate memory for the sensor data, ~20kb RAM
+
+//  memory for the sensor data, ~20kb RAM
 static uint16_t eeMLX90640[832];    
 static uint16_t mlx90640Frame[834]; 
 static float mlx90640Image[768];    
@@ -51,31 +56,31 @@ paramsMLX90640 mlx90640;
 static uint16 current_pan_pwm = 1500;  
 static uint16 current_tilt_pwm = 1500;
 
-// Global Handle for the Text Widget ---
+// text widget
 TEXT_Handle hTxtMode;
 
-// 1. Create a volatile flag for the ISR to talk to the main loop
+// flags for ISR
 volatile uint8_t touch_flag = 0;
 volatile enum Mode{
     AUTO, 
     STATION,
     AUDIO
 };
-enum Mode curMode = AUTO;
+volatile uint8_t spi_tft_busy = 0; // like a semaphore for two SPIs
+volatile enum Mode curMode = AUTO;
 
-#define ALERT_TEMP_CUTOFF 30.0f // Define what counts as "heating object"
-#define BOX_SIZE 10             // 10x10 bounding box
-#define MAX_BOX_X (32 - BOX_SIZE) // Maximum X index (32 - 10 = 22)
-#define MAX_BOX_Y (24 - BOX_SIZE) // Maximum Y index (24 - 10 = 14)
-
-// Box tracking variables
-static uint8_t box_x = 11; // Start centered
+// station mode stuff
+#define ALERT_TEMP_CUTOFF 30.0f 
+#define BOX_SIZE 10             // bounding box
+#define MAX_BOX_X (32 - BOX_SIZE) // 
+#define MAX_BOX_Y (24 - BOX_SIZE) // 
+static uint8_t box_x = 11; //  centered
 static uint8_t box_y = 7;
 
-// MUST BE VOLATILE: Modified inside the new Button ISR
+// flag for Button ISR
 volatile uint8_t control_axis = 0; // 0 = X-axis, 1 = Y-axis
 
-// Helper to force the display to redraw if the box moves
+// redraw if the box moves
 void Force_TFT_Redraw(void)
 {
     for(int i = 0; i < 768; i++) 
@@ -86,7 +91,7 @@ void Force_TFT_Redraw(void)
 
 CY_ISR(Button_ISR_Handler)
 {
-    Pin_Button_ClearInterrupt(); // Clear the interrupt at the pin level
+    Pin_Button_ClearInterrupt(); 
     control_axis = !control_axis; // Toggle 0 and 1
 }
 
@@ -95,18 +100,19 @@ CY_ISR(Touch_ISR_Handler)
     T_INT_ClearInterrupt();
     touch_flag = 1; 
 }
+
 void TFT_Wait(void)
 {
     while(SPIM_1_GetTxBufferSize() > 0); 
     CyDelayUs(5); 
 }
+
 void TFT_SendCommand(uint8_t cmd)
 {
     TFT_Wait();
     DC_Write(0); 
     SPIM_1_ClearTxBuffer(); 
     SPIM_1_ReadTxStatus();  
-    
     SPIM_1_WriteTxData(cmd);
     while(!(SPIM_1_ReadTxStatus() & SPIM_1_STS_SPI_DONE)); 
 }
@@ -206,6 +212,7 @@ uint16_t GetThermalColor(float value, float min, float max)
 
 void Update_TFT_Image(float* thermalImage, float minTemp, float maxTemp)
 {
+    spi_tft_busy = 1;
     uint16_t x, y;
     uint16_t color;
 
@@ -245,11 +252,14 @@ void Update_TFT_Image(float* thermalImage, float minTemp, float maxTemp)
             }
         }
     }
+    spi_tft_busy = 0;
 }
+
 void Update_TFT_Image_Box(float* thermalImage, float minTemp, float maxTemp)
 {
     uint16_t x, y;
     uint16_t color;
+    spi_tft_busy = 1;
 
     for(y = 0; y < 24; y++)
     {
@@ -264,21 +274,21 @@ void Update_TFT_Image_Box(float* thermalImage, float minTemp, float maxTemp)
             {
                 if (x >= box_x && x < box_x + BOX_SIZE && y >= box_y && y < box_y + BOX_SIZE) 
                 {
-                    // If it's on the edge of our 10x10 square, flag it
+                    // on the edge of square
                     if (x == box_x || x == box_x + (BOX_SIZE - 1) || y == box_y || y == box_y + (BOX_SIZE - 1)) {
                         is_border = 1;
                     }
                 }
             }
             
-            // Redraw if temp changed OR if Force_TFT_Redraw wiped prevTemps
+            
             if (fabsf(tempValue - prevTemps[index]) > 1.0f) 
             {
                 prevTemps[index] = tempValue; 
                 
                 // Override color for the bounding box
                 if (is_border) {
-                    color = RED;
+                    color = RED; // actually blue
                 } else {
                     color = GetThermalColor(tempValue, minTemp, maxTemp);
                 }
@@ -306,10 +316,14 @@ void Update_TFT_Image_Box(float* thermalImage, float minTemp, float maxTemp)
             }
         }
     }
+    spi_tft_busy = 0;
 }
+
 // MLX90640 I2C API Functions
 void MLX90640_I2CInit(void) { I2C_MASTER_1_Start(); }
-void MLX90640_I2CFreqSet(int freq) { (void)freq; }
+
+// this is set in the schematic
+void MLX90640_I2CFreqSet(int freq) { (void)freq; } 
 
 int MLX90640_I2CRead(uint8_t slaveAddr, uint16_t startAddress, uint16_t nMemAddressRead, uint16_t *data)
 {
@@ -357,7 +371,7 @@ int MLX90640_I2CWrite(uint8_t slaveAddr, uint16_t writeAddress, uint16_t data)
 int MLX90640_I2CGeneralReset(void)
 {
     if (I2C_MASTER_1_MasterSendStart(0x00, 0) != I2C_MASTER_1_MSTR_NO_ERROR) return -1;
-    I2C_MASTER_1_MasterWriteByte(0x06);
+    I2C_MASTER_1_MasterWriteByte(0x06); // reset cmd
     I2C_MASTER_1_MasterSendStop();
     return 0; 
 }
@@ -394,23 +408,26 @@ static void _cbBackground(WM_MESSAGE * pMsg)
 
             if (NCode == WM_NOTIFICATION_RELEASED) 
             {
-                // Change the text and state
+                // Change the text and state, also update and debounce
                 switch (Id) 
                 {
                     case GUI_ID_BUTTON0:
                         TEXT_SetText(hTxtMode, "Mode: Auto");
                         curMode = AUTO;
                         Force_TFT_Redraw();
+                       //  CyDelay(50);
                         break;
                     case GUI_ID_BUTTON1:
                         TEXT_SetText(hTxtMode, "Mode: Zone");
                         curMode = STATION;
                         Force_TFT_Redraw();
+                        // CyDelay(50);
                         break;
                     case GUI_ID_BUTTON2:
                         TEXT_SetText(hTxtMode, "Mode: Audio");
                         curMode = AUDIO;
                         Force_TFT_Redraw();
+                        //  CyDelay(50);
                         break;
                 }
             }
@@ -421,12 +438,13 @@ static void _cbBackground(WM_MESSAGE * pMsg)
             break;
     }
 }
+
 static uint16_t Touch_Read_Axis(uint8_t command)
 {
     uint16_t data = 0;
     uint8_t msb, lsb;
     CS_1_Write(0); 
-    // Command Byte
+   
     SPIM_2_ClearRxBuffer();
     SPIM_2_WriteTxData(command);
     while(!(SPIM_2_ReadTxStatus() & SPIM_2_STS_SPI_DONE));
@@ -443,31 +461,29 @@ static uint16_t Touch_Read_Axis(uint8_t command)
     lsb = SPIM_2_ReadRxData();
      CS_1_Write(1); 
     // Combine the bytes. 
-    //  12-bit value left-aligned across the 16 bits.
+    // 12-bit value left-aligned across the 16 bits.
     data = ((msb << 8) | lsb) >> 3;
     
     return (data & 0x0FFF); // Mask to ensure it's strictly 12 bits
 }
 
-// The main function called by your loop when the interrupt flag fires
 void Update_Touch_State(void)
 {
     GUI_PID_STATE touchState;
     uint16_t raw_x, raw_y;
     int32_t mapped_x, mapped_y;
 
-    // Read the physical pin state to ensure we are still touching (Debounce check)
     if (T_INT_Read() == 0) 
     {
-        // Read raw 12-bit ADC values from the touch controller
+        // 12-bit ADC values 
         raw_x = Touch_Read_Axis(CMD_READ_X);
         raw_y = Touch_Read_Axis(CMD_READ_Y);
 
-        // Map the raw ADC values (0-4095) to screen coordinates (320x240)
+        //  ADC values  to screen coordinates 
         mapped_x = ((int32_t)(raw_x - TOUCH_X_MIN) * LCD_WIDTH) / (TOUCH_X_MAX - TOUCH_X_MIN);
         mapped_y = ((int32_t)(raw_y - TOUCH_Y_MIN) * LCD_HEIGHT) / (TOUCH_Y_MAX - TOUCH_Y_MIN);
 
-        // Clamp the mapped values so they don't draw outside the screen bounds
+        // Clamp the mapped values 
         if (mapped_x < 0) mapped_x = 0;
         if (mapped_x >= LCD_WIDTH) mapped_x = LCD_WIDTH - 1;
         
@@ -483,7 +499,7 @@ void Update_Touch_State(void)
     } 
     else 
     {
-        // Screen is not currently being touched
+        // Screen is not currently being touched, debounce
         touchState.x = -1;
         touchState.y = -1;
         touchState.Pressed = 0;
@@ -491,6 +507,7 @@ void Update_Touch_State(void)
 
     GUI_TOUCH_StoreStateEx(&touchState);
 }
+
 int main(void)
 {
     CyGlobalIntEnable; 
@@ -507,14 +524,12 @@ int main(void)
     ADC_DelSig_1_StartConvert();        // start the ADC_DelSig_1 conversion
     LED_Write(1); 
     
-    // --- ATTACH ISRs ---
+    // ISRs
     T_ISR_StartEx(Touch_ISR_Handler); 
-    Button_ISR_StartEx(Button_ISR_Handler); // <--- START THE NEW BUTTON ISR HERE
-    
-    CS_1_Write(0);
-    Touch_Read_Axis(CMD_READ_X); // 0xD0 has PD0=0, enabling PENIRQ
-    CS_1_Write(1);
-    
+    Button_ISR_StartEx(Button_ISR_Handler); 
+    // enable 
+    Touch_Read_Axis(CMD_READ_X); // enable pen interrupt
+   
     // Initialize Display
     TFT_Init(); 
     
@@ -524,6 +539,7 @@ int main(void)
     // Attach the callback to the background window
     WM_SetCallback(WM_HBKWIN, _cbBackground);
     
+    // change the UI 
     GUI_SetFont(&GUI_Font16_ASCII);
     GUI_SetColor(GUI_WHITE);
     
@@ -568,7 +584,7 @@ int main(void)
             uint8_t old_box_x = box_x;
             uint8_t old_box_y = box_y;
             
-            // control_axis is safely toggled by the Button_ISR_Handler now
+            // check what button ISR did
             if (control_axis == 0) {
                 // Map 0-4095 to 0-22
                 box_x = (uint8_t)(((uint32_t)adc_val * MAX_BOX_X) / 4095);
@@ -577,25 +593,27 @@ int main(void)
                 box_y = (uint8_t)(((uint32_t)adc_val * MAX_BOX_Y) / 4095);
             }
 
-            // If the box moved, force the screen to redraw to clear old red borders
+            // If the box moved, force the screen to redraw 
             if (box_x != old_box_x || box_y != old_box_y) {
                 Force_TFT_Redraw();
             }
         }
         
         int status = MLX90640_GetFrameData(MLX_I2C_ADDR, mlx90640Frame);
-        if (T_INT_Read() == 0 || touch_flag == 1) 
+        if ((T_INT_Read() == 0 || touch_flag == 1) && !spi_tft_busy) 
         {
-            // Mask the interrupt so SPI traffic doesn't trigger the ISR 
+            // temp disable ISR 
             T_ISR_Disable();
             Update_Touch_State();   // SPI touch read here
             T_ISR_ClearPending();
             T_ISR_Enable();
+            touch_flag = 0;
         }
         
-        GUI_Exec(); // EmWin processes the touch states here
+        GUI_Exec(); 
+        CyDelay(50); // debounce? 
         
-        if (status >= 0) 
+        if (status >= 0)  // the camera returned a frame
         {
             MLX90640_GetImage(mlx90640Frame, &mlx90640, mlx90640Image);  
             float minTemp = mlx90640Image[0];
@@ -603,6 +621,7 @@ int main(void)
             uint16_t max_x = 0;
             uint16_t max_y = 0;
             
+            // compute the heat point and coordinates
             for (int i = 0; i < 768; i++) 
             {
                 if (mlx90640Image[i] < minTemp) minTemp = mlx90640Image[i];
@@ -612,6 +631,8 @@ int main(void)
                     max_y = i / 32;
                 }
             }
+            
+            // mode switching 
             if (curMode == AUTO){
                 Track_Target(minTemp, maxTemp, max_x, max_y);     
                 Update_TFT_Image(mlx90640Image, minTemp, maxTemp); 
@@ -640,14 +661,14 @@ int main(void)
                 }
 
                 if (target_detected) {
-                    PWM_ALERT_WriteCompare(30); // Turn alert ON
+                    PWM_ALERT_WriteCompare(30); //  alert ON
                 } else {
-                    PWM_ALERT_WriteCompare(0);  // Turn alert OFF
+                    PWM_ALERT_WriteCompare(0);  //  alert OFF
                 }
             }
             else 
             {
-                PWM_ALERT_WriteCompare(0); // Ensure alert is off if not in STATION mode
+                PWM_ALERT_WriteCompare(0); //  alert is off 
             }
             
         }

@@ -67,7 +67,8 @@ void writeM8_a1(uint8 *pData, int N)
 //==============================================================
 uint8 read8_a1(void)
 {
-	for (;;) {}                                     // read function not implemented
+		return 0x00;                                     // read function not implemented
+                                   // read function not implemented
 };
 
 //==============================================================
@@ -79,9 +80,13 @@ uint8 read8_a1(void)
 //      N - the number of values that will be read (also size of 
 //          the array pData)
 //==============================================================
-void readM8_a1(uint8 *pData, int N)
+void  readM8_a1(uint8 *pData, int N)
 {
-	for (;;) {}                                     // read function not implemented
+	 int i;
+    for (i = 0; i < N; i++)
+    {
+        pData[i] = 0x00; 
+    }                                    // read function not implemented
 }
 
 //==============================================================
