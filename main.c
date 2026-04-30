@@ -32,6 +32,8 @@ static float prevTemps[768] = {-100.0f};
 #define MAX_PWM_TILT 2500
 #define MIN_PWM_PAN 1000
 #define MIN_PWM_TILT 1200
+#define MIDDLE_PWM_PAN 1500
+#define MIDDLE_PWM_TILT 1800
 
 // touch screen
 #define TOUCH_X_MIN 300
@@ -56,6 +58,17 @@ paramsMLX90640 mlx90640;
 static uint16 current_pan_pwm = 1500;  
 static uint16 current_tilt_pwm = 1500;
 
+typedef struct {
+    float pos;
+    float vel;
+    float p00, p01, p11;
+    float q_pos, q_vel;
+    float r; 
+} KalmanFilter;
+
+KalmanFilter KALMAN_PAN;
+KalmanFilter KALMAN_TILT;
+
 // text widget
 TEXT_Handle hTxtMode;
 
@@ -70,7 +83,8 @@ volatile uint8_t spi_tft_busy = 0; // like a semaphore for two SPIs
 volatile enum Mode curMode = AUTO;
 
 // station mode stuff
-#define ALERT_TEMP_CUTOFF 30.0f 
+#define DT 0.25
+#define ALERT_TEMP_CUTOFF 120.0f 
 #define BOX_SIZE 10             // bounding box
 #define MAX_BOX_X (32 - BOX_SIZE) // 
 #define MAX_BOX_Y (24 - BOX_SIZE) // 
@@ -395,6 +409,64 @@ void Track_Target(float minTemp, float maxTemp, uint16_t target_x, uint16_t targ
     PWM_Tilt_WriteCompare(current_tilt_pwm);
 }
 
+void Update_Kalman(KalmanFilter* axis,  float target){
+    axis->pos = axis->pos + DT *  axis->vel;
+    axis->p00 = axis->p00 + 2 * axis->p01 + axis->p11 + axis->q_pos;
+    axis->p01 = axis->p01 + axis->p11;    
+    axis->p11 = axis->p11 + axis->q_vel;
+    
+    float error = target - axis->pos;
+    float S = axis->p00 + axis->r;
+    float k0 = axis->p00 / S;
+    float k1 = axis->p01 / S;
+    // apply kalman gain
+    axis->pos += (error * k0);
+    axis->vel += (error * k1);
+    float p00_temp = axis->p00;
+    axis->p00 = p00_temp - (k0 * p00_temp);
+    float p01_temp = axis->p01;
+    axis->p01 = p01_temp - (k0 * p01_temp);
+    axis->p11 -= k1 * p01_temp; 
+}
+
+void Track_Target_Kalman(float minTemp, float maxTemp, uint16_t target_x, uint16_t target_y) 
+{
+    if (maxTemp - minTemp < TARGET_CUTOFF) return;
+    
+    Update_Kalman(&KALMAN_PAN,  target_x);
+    Update_Kalman(&KALMAN_TILT,  target_y);
+    float smoothed_error_x = KALMAN_PAN.pos - CENTER_X; 
+    float smoothed_error_y = KALMAN_TILT.pos - CENTER_Y;
+  
+    current_pan_pwm  += (int16)(smoothed_error_x * K_PAN);
+    current_tilt_pwm += (int16)(smoothed_error_y * K_TILT);
+    
+
+    if (current_pan_pwm > MAX_PWM_PAN) current_pan_pwm = MAX_PWM_PAN;
+    if (current_pan_pwm < MIN_PWM_PAN) current_pan_pwm = MIN_PWM_PAN;
+    if (current_tilt_pwm > MAX_PWM_TILT) current_tilt_pwm = MAX_PWM_TILT;
+    if (current_tilt_pwm < MIN_PWM_TILT) current_tilt_pwm = MIN_PWM_TILT;
+    
+    PWM_Pan_WriteCompare(current_pan_pwm);
+    PWM_Tilt_WriteCompare(current_tilt_pwm);
+}
+
+void Init_Kalman(){
+    
+    KALMAN_PAN.pos = CENTER_X;
+    KALMAN_TILT.pos = CENTER_Y;
+    
+    KALMAN_PAN.r = 5.0f;
+    KALMAN_TILT.r = 5.0f;
+    
+    KALMAN_PAN.q_pos = 0.5f;
+    KALMAN_PAN.q_vel = 0.1f;
+    
+    KALMAN_TILT.q_pos = 0.1f;
+    KALMAN_TILT.q_vel = 0.01f;
+}
+
+
 //  events on the background window 
 static void _cbBackground(WM_MESSAGE * pMsg) 
 {
@@ -516,6 +588,7 @@ int main(void)
     PWM_Pan_Start();
     PWM_Tilt_Start();
     PWM_ALERT_Start();
+    PWM_ALERT_WriteCompare(0); 
 
     SPIM_1_Start();
     SPIM_2_Start();
@@ -529,7 +602,8 @@ int main(void)
     Button_ISR_StartEx(Button_ISR_Handler); 
     // enable 
     Touch_Read_Axis(CMD_READ_X); // enable pen interrupt
-   
+    // Init states of Kalman filters
+    Init_Kalman();
     // Initialize Display
     TFT_Init(); 
     
@@ -635,8 +709,8 @@ int main(void)
             // mode switching 
             if (curMode == AUTO){
                 Track_Target(minTemp, maxTemp, max_x, max_y);     
+                // Track_Target_Kalman(minTemp, maxTemp, max_x, max_y);
                 Update_TFT_Image(mlx90640Image, minTemp, maxTemp); 
-
             }
             
             if (curMode == STATION)

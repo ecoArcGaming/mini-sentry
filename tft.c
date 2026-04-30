@@ -95,15 +95,59 @@ void  readM8_a1(uint8 *pData, int N)
 //==============================================================
 void tftStart(void)
 {
-    write8_a0(0x01);         			// send Software Reset Command (must wait at least 5ms after command)
-    CyDelay(10);
-    write8_a0(0x36);         			// send Memory Access Control command
-	write8_a1(0x88);
-    write8_a0(0x3A);         			// send COLMOD: Pixel Format Set command
+    RESET_Write(1);
+    CyDelay(5);
+    RESET_Write(0);
+    CyDelay(20);
+    RESET_Write(1);
+    CyDelay(150);
+
+    // Software Reset
+    write8_a0(0x01);
+    CyDelay(5);
+
+    // Power Control 1
+    write8_a0(0xC0);
+    write8_a1(0x21);
+
+    // Power Control 2
+    write8_a0(0xC1);
+    write8_a1(0x10);
+
+    // VCOM Control 1
+    write8_a0(0xC5);
+    write8_a1(0x31);
+    write8_a1(0x3C);
+
+    // VCOM Control 2
+    write8_a0(0xC7);
+    write8_a1(0xC0);
+
+    // Display Function Control
+    write8_a0(0xB6);
+    write8_a1(0x0A);
+    write8_a1(0x82);
+    write8_a1(0x27);
+    write8_a1(0x00);
+
+    // Memory Access Control
+    write8_a0(0x36);
+    write8_a1(0x20);
+
+    // Pixel Format
+    write8_a0(0x3A);
     write8_a1(0x55);
-    write8_a0(0x11);         			// send Sleep Out command
-    write8_a0(0x29);         			// send Display ON command
-    CyDelay(250);            			// delay to allow all changes to take effect	
+
+    // Sleep Out
+    write8_a0(0x11);
+    CyDelay(120);
+
+    // Normal Display Mode
+    write8_a0(0x13);
+
+    // Display On
+    write8_a0(0x29);
+    CyDelay(250);
 }
 
 
